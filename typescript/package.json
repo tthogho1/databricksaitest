@@ -1,0 +1,19 @@
+{
+  "name": "databricks-typescript",
+  "version": "1.0.0",
+  "description": "Databricks Vector Search + LLM summarization in TypeScript",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/run.js",
+    "dev":   "ts-node run.ts"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "openai": "^4.52.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "ts-node":     "^10.9.2",
+    "typescript":  "^5.5.0"
+  }
+}

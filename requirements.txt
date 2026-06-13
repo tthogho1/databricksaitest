@@ -1,0 +1,3 @@
+databricks-ai-search
+python-dotenv
+openai
