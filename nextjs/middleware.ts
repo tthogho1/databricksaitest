@@ -30,6 +30,10 @@ export function middleware(request: NextRequest) {
     response.headers.set(key, value);
   }
 
+  console.log(
+    `[CORS] ${request.method} ${request.nextUrl.pathname} に CORS ヘッダーを付与しました (origin: ${ALLOWED_ORIGIN})`
+  );
+
   return response;
 }
 
