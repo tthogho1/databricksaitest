@@ -5,6 +5,7 @@ import { useState } from "react";
 interface ResultItem {
   title: string;
   content: string;
+  url: string;
 }
 
 interface ApiResponse {
@@ -111,7 +112,18 @@ export default function Home() {
                   <span className="inline-flex h-7 w-7 flex-shrink-0 items-center justify-center rounded-full bg-accent text-sm font-bold text-bg">
                     {i + 1}
                   </span>
-                  {r.title}
+                  {r.url ? (
+                    <a
+                      href={r.url}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="text-accent underline-offset-2 transition hover:underline"
+                    >
+                      {r.title}
+                    </a>
+                  ) : (
+                    r.title
+                  )}
                 </h3>
                 <p className="whitespace-pre-wrap text-muted">
                   {r.content.length > 400
