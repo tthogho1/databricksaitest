@@ -7,29 +7,44 @@ export const maxDuration = 60;
 // Environment variables are loaded automatically by Next.js:
 //   • Local dev → nextjs/.env.local
 //   • Vercel    → Project Settings → Environment Variables
-const WORKSPACE_URL = (process.env.WORKSPACE_URL ?? "").replace(/\/$/, "");
+const DATABRICKS_HOST = (() => {
+  const host = (process.env.DATABRICKS_HOST ?? "").trim().replace(/\/$/, "");
+  if (!host) return "";
+  return /^https?:\/\//.test(host) ? host : `https://${host}`;
+})();
 const DATABRICKS_TOKEN = process.env.DATABRICKS_TOKEN ?? "";
 
 // ── Config (overridable via environment variables) ──────────────────────────
-const INDEX_NAME =
-  process.env.INDEX_NAME ?? "workspace.default.wikivoyage_index";
+const VS_INDEX =
+  process.env.DATABRICKS_VS_INDEX ??
+  "workspace.default.wikivoyage_page_index_ai_search";
+const EMBEDDING_ENDPOINT =
+  process.env.DATABRICKS_EMBEDDING_ENDPOINT ?? "databricks-qwen3-embedding-0-6b";
 const LLM_MODEL =
   process.env.LLM_MODEL ?? "databricks-meta-llama-3-3-70b-instruct";
 
+// Qwen3-Embedding: queries get this instruction; the chunks were embedded without one.
+const QUERY_PREFIX =
+  "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:";
+
+const PAGE_TYPES = ["city", "region", "country"];
+
 // ── Types ─────────────────────────────────────────────────────────────────────
 interface SearchResponse {
-  result: { data_array: (string | number | null)[][] };
-  manifest: { columns: { name: string }[] };
+  result?: { data_array?: (string | number | null)[][] };
+  manifest?: { columns?: { name: string }[] };
 }
 
 export interface ResultItem {
   title: string;
-  content: string;
+  section: string;
   url: string;
+  content: string;
+  score: number;
 }
 
 // 日本語（ひらがな・カタカナ・漢字）が含まれるか判定
-const JP_REGEX = /[぀-ヿ㐀-䶿一-鿿豈-﫿]/;
+const JP_REGEX = /[぀-ヿ㐀-䶿一-鿿豈-﫿]/;
 const isJapanese = (text: string): boolean => JP_REGEX.test(text);
 
 // ── LLM で翻訳（余計な説明を付けず訳文のみ返す） ──────────────────────────────
@@ -56,12 +71,37 @@ async function translate(
   return res.choices[0].message.content?.trim() ?? text;
 }
 
-// ── Vector Search via REST API ────────────────────────────────────────────────
+// ── Embed the query with the Qwen3 serving endpoint (L2-normalized) ──────────
+async function embedQuery(question: string): Promise<number[]> {
+  const url = `${DATABRICKS_HOST}/serving-endpoints/${EMBEDDING_ENDPOINT}/invocations`;
+
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${DATABRICKS_TOKEN}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ input: [QUERY_PREFIX + question] }),
+  });
+
+  if (!response.ok) {
+    const error = await response.text();
+    throw new Error(`Embedding failed [${response.status}]: ${error}`);
+  }
+
+  const json = await response.json();
+  const vec: number[] = json?.data?.[0]?.embedding ?? [];
+  const norm = Math.sqrt(vec.reduce((sum, x) => sum + x * x, 0));
+  return norm > 0 ? vec.map((x) => x / norm) : vec;
+}
+
+// ── Vector Search via REST API (precomputed-vector index) ────────────────────
 async function similaritySearch(
-  queryText: string,
-  numResults: number
+  queryVector: number[],
+  numResults: number,
+  pageType?: string
 ): Promise<SearchResponse> {
-  const url = `${WORKSPACE_URL}/api/2.0/vector-search/indexes/${INDEX_NAME}/query`;
+  const url = `${DATABRICKS_HOST}/api/2.0/vector-search/indexes/${VS_INDEX}/query`;
 
   const response = await fetch(url, {
     method: "POST",
@@ -70,10 +110,10 @@ async function similaritySearch(
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
+      query_vector: queryVector,
+      columns: ["title", "section", "url", "chunk_text"],
       num_results: numResults,
-      columns: ["content", "title", "url"],
-      query_text: queryText,
-      query_type: "HYBRID",
+      ...(pageType ? { filters_json: JSON.stringify({ page_type: pageType }) } : {}),
     }),
   });
 
@@ -88,16 +128,19 @@ async function similaritySearch(
 // ── POST /api/search ──────────────────────────────────────────────────────────
 export async function POST(req: NextRequest) {
   try {
-    if (!WORKSPACE_URL || !DATABRICKS_TOKEN) {
+    if (!DATABRICKS_HOST || !DATABRICKS_TOKEN) {
       return NextResponse.json(
-        { error: "Missing WORKSPACE_URL or DATABRICKS_TOKEN. Check the root .env file." },
+        { error: "Missing DATABRICKS_HOST or DATABRICKS_TOKEN. Check nextjs/.env.local." },
         { status: 500 }
       );
     }
 
     const body = await req.json();
     const query: string = (body?.query ?? "").trim();
-    const numResults: number = body?.numResults ?? 3;
+    const numResults: number = Math.min(Math.max(Number(body?.numResults) || 5, 1), 20);
+    const pageType: string | undefined = PAGE_TYPES.includes(body?.pageType)
+      ? body.pageType
+      : undefined;
 
     if (!query) {
       return NextResponse.json({ error: "Query must not be empty." }, { status: 400 });
@@ -105,7 +148,7 @@ export async function POST(req: NextRequest) {
 
     const llmClient = new OpenAI({
       apiKey: DATABRICKS_TOKEN,
-      baseURL: `${WORKSPACE_URL}/serving-endpoints`,
+      baseURL: `${DATABRICKS_HOST}/serving-endpoints`,
     });
 
     // 0) 日本語クエリなら英語に翻訳してから検索（インデックスは英語データ）
@@ -114,30 +157,35 @@ export async function POST(req: NextRequest) {
       ? await translate(llmClient, query, "English")
       : query;
 
-    // 1) Similarity search
-    const search = await similaritySearch(searchQuery, numResults);
+    // 1) Embed the query, then similarity search
+    const search = await similaritySearch(await embedQuery(searchQuery), numResults, pageType);
     const hits = search?.result?.data_array ?? [];
     const colNames = (search?.manifest?.columns ?? []).map((c) => c.name);
 
     const results: ResultItem[] = hits.map((hit) => {
-      const row: Record<string, string> = {};
+      const row: Record<string, string | number | null> = {};
       colNames.forEach((name, idx) => {
-        row[name] = String(hit[idx] ?? "");
+        row[name] = hit[idx];
       });
+      // chunk_text starts with a "Title (type, region) — Section" header line; drop it
+      const text = String(row["chunk_text"] ?? "");
+      const content = text.includes("\n") ? text.slice(text.indexOf("\n") + 1) : text;
       return {
-        title: row["title"] ?? "N/A",
-        content: row["content"] ?? "",
-        url: row["url"] ?? "",
+        title: String(row["title"] ?? "N/A"),
+        section: String(row["section"] ?? ""),
+        url: String(row["url"] ?? ""),
+        content,
+        score: Number(row["score"] ?? 0),
       };
     });
 
     if (results.length === 0) {
-      return NextResponse.json({ results: [], summary: "No results found." });
+      return NextResponse.json({ results: [], summary: "No results found.", searchQuery });
     }
 
     // 2) Summarize with Databricks LLM
     const contextText = results
-      .map((r) => `Title: ${r.title}\n${r.content}`)
+      .map((r) => `Title: ${r.title}${r.section ? ` — ${r.section}` : ""}\n${r.content}`)
       .join("\n\n---\n\n");
 
     // 日本語クエリの場合は日本語で、英語クエリの場合は英語で要約を生成
@@ -168,16 +216,12 @@ export async function POST(req: NextRequest) {
       ? await Promise.all(
           results.map(async (r) => ({
             ...r,
-            content: await translate(
-              llmClient,
-              r.content.slice(0, 600),
-              "Japanese"
-            ),
+            content: await translate(llmClient, r.content.slice(0, 600), "Japanese"),
           }))
         )
       : results;
 
-    return NextResponse.json({ results: displayResults, summary });
+    return NextResponse.json({ results: displayResults, summary, searchQuery });
   } catch (err) {
     return NextResponse.json(
       { error: (err as Error).message },
