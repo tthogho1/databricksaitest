@@ -4,18 +4,32 @@ import { useState } from "react";
 
 interface ResultItem {
   title: string;
-  content: string;
+  section: string;
   url: string;
+  content: string;
+  score: number;
 }
 
 interface ApiResponse {
   results: ResultItem[];
   summary: string;
+  searchQuery?: string;
   error?: string;
 }
 
+const PAGE_TYPES = [
+  { value: "", label: "All types" },
+  { value: "city", label: "City" },
+  { value: "region", label: "Region" },
+  { value: "country", label: "Country" },
+];
+
+const NUM_RESULTS = [3, 5, 10];
+
 export default function Home() {
   const [query, setQuery] = useState("best places to visit in Japan");
+  const [pageType, setPageType] = useState("");
+  const [numResults, setNumResults] = useState(5);
   const [loading, setLoading] = useState(false);
   const [data, setData] = useState<ApiResponse | null>(null);
   const [error, setError] = useState("");
@@ -32,7 +46,7 @@ export default function Home() {
       const res = await fetch("/api/search", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query, numResults: 3 }),
+        body: JSON.stringify({ query, numResults, pageType }),
       });
       const json: ApiResponse = await res.json();
       if (!res.ok) throw new Error(json.error || "Request failed");
@@ -51,7 +65,7 @@ export default function Home() {
           🧭 Wikivoyage AI Search
         </h1>
         <p className="mt-2 text-sm text-muted sm:text-base">
-          Hybrid vector search on Databricks, summarized by an LLM.
+          Vector search over Wikivoyage chunks on Databricks, summarized by an LLM.
         </p>
       </header>
 
@@ -75,6 +89,35 @@ export default function Home() {
           {loading ? "Searching…" : "Search"}
         </button>
       </form>
+
+      <div className="mb-6 flex flex-wrap gap-3 text-sm">
+        <select
+          value={pageType}
+          onChange={(e) => setPageType(e.target.value)}
+          disabled={loading}
+          aria-label="Page type"
+          className="rounded-lg border border-slate-700 bg-panel px-3 py-2 text-slate-200 outline-none focus:border-accent disabled:opacity-60"
+        >
+          {PAGE_TYPES.map((t) => (
+            <option key={t.value} value={t.value}>
+              {t.label}
+            </option>
+          ))}
+        </select>
+        <select
+          value={numResults}
+          onChange={(e) => setNumResults(Number(e.target.value))}
+          disabled={loading}
+          aria-label="Number of results"
+          className="rounded-lg border border-slate-700 bg-panel px-3 py-2 text-slate-200 outline-none focus:border-accent disabled:opacity-60"
+        >
+          {NUM_RESULTS.map((n) => (
+            <option key={n} value={n}>
+              {n} results
+            </option>
+          ))}
+        </select>
+      </div>
 
       {error && (
         <div className="mb-6 rounded-xl border border-red-500/40 bg-red-500/10 px-4 py-3 text-red-300">
@@ -101,6 +144,9 @@ export default function Home() {
 
           <h2 className="mb-4 text-base font-medium text-muted sm:text-lg">
             Top Results
+            {data.searchQuery && data.searchQuery !== query.trim() && (
+              <span className="ml-2 text-sm">(searched as “{data.searchQuery}”)</span>
+            )}
           </h2>
           <div className="flex flex-col gap-4">
             {data.results.map((r, i) => (
@@ -124,7 +170,13 @@ export default function Home() {
                   ) : (
                     r.title
                   )}
+                  <span className="ml-auto text-xs font-normal text-muted">
+                    {r.score.toFixed(3)}
+                  </span>
                 </h3>
+                {r.section && (
+                  <p className="mb-2 text-sm text-accent2">{r.section}</p>
+                )}
                 <p className="whitespace-pre-wrap text-muted">
                   {r.content.length > 400
                     ? r.content.substring(0, 400) + "…"

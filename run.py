@@ -1,3 +1,4 @@
+import math
 import os
 from dotenv import load_dotenv
 from databricks.ai_search.client import VectorSearchClient
@@ -6,12 +7,12 @@ from openai import OpenAI
 # ── Load environment variables from .env ──────────────────────────────────────
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"), override=False)
 
-workspace_url = os.environ.get("WORKSPACE_URL")
-access_token  = os.environ.get("DATABRICKS_TOKEN")
+host         = (os.environ.get("DATABRICKS_HOST") or "").strip().rstrip("/")
+access_token = os.environ.get("DATABRICKS_TOKEN")
 
 # Validate required variables
 missing = [k for k, v in {
-    "WORKSPACE_URL":    workspace_url,
+    "DATABRICKS_HOST":  host,
     "DATABRICKS_TOKEN": access_token,
 }.items() if not v]
 
@@ -21,13 +22,22 @@ if missing:
         "Edit the .env file in the project root and set the values there."
     )
 
-print(f"WORKSPACE_URL    : {workspace_url}")
+workspace_url = host if host.startswith(("https://", "http://")) else "https://" + host
+
+print(f"DATABRICKS_HOST  : {workspace_url}")
 print(f"DATABRICKS_TOKEN : {'*' * len(access_token)}")
 
 # ── Config ───────────────────────────────────────────────────────────────────
-LLM_MODEL = "databricks-meta-llama-3-3-70b-instruct"  # ← change to any available serving endpoint
+ENDPOINT_NAME      = os.environ.get("DATABRICKS_VS_ENDPOINT", "wikivoyage-ai-search-endpoint")
+INDEX_NAME         = os.environ.get("DATABRICKS_VS_INDEX", "workspace.default.wikivoyage_page_index_ai_search")
+EMBEDDING_ENDPOINT = os.environ.get("DATABRICKS_EMBEDDING_ENDPOINT", "databricks-qwen3-embedding-0-6b")
+LLM_MODEL          = os.environ.get("LLM_MODEL", "databricks-meta-llama-3-3-70b-instruct")
 
-# ── Initialize Vector Search Client ───────────────────────────────────────────
+# Qwen3-Embedding: queries get this instruction; the chunks were embedded without one.
+QUERY_PREFIX = ("Instruct: Given a web search query, retrieve relevant passages "
+                "that answer the query\nQuery:")
+
+# ── Initialize clients ────────────────────────────────────────────────────────
 vsc = VectorSearchClient(
     workspace_url=workspace_url,
     personal_access_token=access_token,
@@ -35,10 +45,13 @@ vsc = VectorSearchClient(
 )
 print("\nVectorSearchClient initialized successfully.")
 
-# ── Connect to Vector Search Index ────────────────────────────────────────────
-ENDPOINT_NAME = "wikivoyage_seach_endpoint"
-INDEX_NAME    = "workspace.default.wikivoyage_index"
+# Databricks serving endpoints (embedding + LLM) are OpenAI-compatible
+llm_client = OpenAI(
+    api_key=access_token,
+    base_url=f"{workspace_url}/serving-endpoints",
+)
 
+# ── Connect to Vector Search Index ────────────────────────────────────────────
 index = vsc.get_index(
     endpoint_name=ENDPOINT_NAME,
     index_name=INDEX_NAME,
@@ -46,16 +59,23 @@ index = vsc.get_index(
 print(f"Connected to index : {INDEX_NAME}")
 print(f"Endpoint           : {ENDPOINT_NAME}")
 
-# ── Perform Hybrid Similarity Search with Reranking ───────────────────────────
+# ── Embed the query (L2-normalized) ───────────────────────────────────────────
 QUERY_TEXT  = "best places to visit in Japan"   # ← change me
 NUM_RESULTS = 3
-COLUMNS     = ["content", "title"]
 
+embedding = llm_client.embeddings.create(
+    model=EMBEDDING_ENDPOINT,
+    input=[QUERY_PREFIX + QUERY_TEXT],
+    encoding_format="float",  # Databricks returns floats; the SDK default (base64) can garble them
+).data[0].embedding
+norm = math.sqrt(sum(x * x for x in embedding))
+query_vector = [x / norm for x in embedding]
+
+# ── Perform Similarity Search ─────────────────────────────────────────────────
 results = index.similarity_search(
+    query_vector=query_vector,
+    columns=["title", "section", "url", "chunk_text"],
     num_results=NUM_RESULTS,
-    columns=COLUMNS,
-    query_text=QUERY_TEXT,
-    query_type="HYBRID",
 )
 
 # ── Display results ────────────────────────────────────────────────────────────
@@ -74,11 +94,14 @@ context_parts = []
 for rank, hit in enumerate(hits, start=1):
     row = dict(zip(col_names, hit))
     title   = row.get("title", "N/A")
-    content = str(row.get("content", ""))
+    section = row.get("section", "")
+    # chunk_text starts with a "Title (type, region) — Section" header line; drop it
+    content = str(row.get("chunk_text", "")).split("\n", 1)[-1]
     print(f"\n── Result {rank} ──────────────────────────────────────")
-    print(f"  Title   : {title}")
+    print(f"  Title   : {title} — {section}  [{row.get('score', 0):.3f}]")
+    print(f"  URL     : {row.get('url', '')}")
     print(f"  Content : {content[:300]}{'...' if len(content) > 300 else ''}")
-    context_parts.append(f"Title: {title}\n{content}")
+    context_parts.append(f"Title: {title} — {section}\n{content}")
 
 # ── Summarize with Databricks LLM ─────────────────────────────────────────────
 print("\n" + "=" * 60)
@@ -90,11 +113,6 @@ prompt = (
     f'Based on the following travel information retrieved for the query "{QUERY_TEXT}",\n'
     f"write a concise and engaging summary (3-5 sentences) highlighting the key points.\n\n"
     f"Retrieved information:\n{context_text}\n\nSummary:"
-)
-
-llm_client = OpenAI(
-    api_key=access_token,
-    base_url=f"{workspace_url}/serving-endpoints",
 )
 
 chat_response = llm_client.chat.completions.create(
